@@ -26,6 +26,8 @@
 
 int count = 0;
 
+// JUST A TEST
+
 int
 mynewt_main(int argc, char **argv)
 {
