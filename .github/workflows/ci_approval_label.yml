@@ -1,0 +1,132 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#  http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+
+name: Await label removal
+
+on:
+  pull_request:
+    types: [opened, ready_for_review]
+
+env:
+  LABEL: needs-ci-approval
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+
+jobs:
+  add-label:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.addLabels({
+              ...context.repo,
+              issue_number: context.issue.number,
+              labels: [process.env.LABEL],
+            });
+
+  wait-for-removal:
+    needs: add-label
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    outputs:
+      timed_out: ${{ steps.wait.outputs.timed_out }}
+      reason:   ${{ steps.wait.outputs.reason }}
+    env:
+      REPO: ${{ github.repository }}
+      PR: ${{ github.event.pull_request.number }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Ensure jq is available
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - id: wait
+        name: Wait until label is removed (max ~6h)
+        continue-on-error: true
+        run: |
+          API="https://api.github.com"
+
+          # 6 hours @ 20s interval = 1080 iterations
+          for i in $(seq 1 1080); do
+            has_label=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+                               -H "Accept: application/vnd.github+json" \
+                               "$API/repos/$REPO/issues/$PR/labels" \
+                        | jq -r --arg L "$LABEL" 'map(.name) | index($L) // empty')
+            if [ -z "$has_label" ]; then
+              echo "timed_out=false" >> "$GITHUB_OUTPUT"
+              echo "reason=removed" >> "$GITHUB_OUTPUT"
+              echo "Label '$LABEL' removed — continuing."
+              exit 0
+            fi
+
+            state=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+                              -H "Accept: application/vnd.github+json" \
+                              "$API/repos/$REPO/pulls/$PR" | jq -r '.state')
+            if [ "$state" != "open" ]; then
+              echo "timed_out=false" >> "$GITHUB_OUTPUT"
+              echo "reason=pr_closed" >> "$GITHUB_OUTPUT"
+              echo "PR is $state. Exiting."
+              exit 1
+            fi
+
+            echo "Still labeled; sleeping 20s… ($i/1080)"
+            sleep 20
+          done
+
+          echo "timed_out=true" >> "$GITHUB_OUTPUT"
+          echo "reason=timeout" >> "$GITHUB_OUTPUT"
+          echo "Timed out waiting for label removal (~6h)."
+          exit 1
+
+  do-stuff-after:
+    needs: wait-for-removal
+    if: ${{ needs.wait-for-removal.outputs.timed_out == 'false' && needs.wait-for-removal.outputs.reason == 'removed' }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Proceeding because '$LABEL' was removed by a human."
+
+  cleanup-on-timeout:
+    needs: wait-for-removal
+    if: ${{ needs.wait-for-removal.outputs.timed_out == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      contents: read
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const name = process.env.LABEL;
+            try {
+              await github.rest.issues.removeLabel({
+                ...context.repo,
+                issue_number: context.issue.number,
+                name,
+              });
+              core.info(`Removed label '${name}' after timeout.`);
+            } catch (e) {
+              if (e.status === 404) {
+                core.info(`Label '${name}' not present; nothing to remove.`);
+              } else {
+                throw e;
+              }
+            }
