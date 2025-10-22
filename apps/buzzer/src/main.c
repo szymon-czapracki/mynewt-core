@@ -22,6 +22,8 @@
 #include "sysinit/sysinit.h"
 #include "os/os.h"
 
+// TEST
+
 #include "buzzer/buzzer.h"
 
 int count = 0;
