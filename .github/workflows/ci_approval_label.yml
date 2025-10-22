@@ -1,0 +1,123 @@
+# .github/workflows/await-label-removal.yml
+name: Await label removal
+
+on:
+  pull_request:
+    types: [opened, ready_for_review]
+
+env:
+  LABEL: needs-ci-approval   # change if you prefer another name
+
+jobs:
+  label-and-wait:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    # If you rely on GITHUB_TOKEN only, make sure repo:
+    # Settings → Actions → Workflow permissions = "Read and write"
+    permissions:
+      issues: write
+      contents: read
+    env:
+      REPO: ${{ github.repository }}
+      PR: ${{ github.event.pull_request.number }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      LABEL_BOT_TOKEN: ${{ secrets.LABEL_BOT_TOKEN }} # optional PAT; used if present
+    steps:
+      - name: Ensure jq is available
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Choose auth token (PAT beats GITHUB_TOKEN)
+        id: auth
+        run: |
+          if [ -n "${LABEL_BOT_TOKEN}" ]; then
+            echo "token_source=LABEL_BOT_TOKEN" >> "$GITHUB_OUTPUT"
+            echo "token=${LABEL_BOT_TOKEN}"     >> "$GITHUB_OUTPUT"
+          else
+            echo "token_source=GITHUB_TOKEN"    >> "$GITHUB_OUTPUT"
+            echo "token=${GITHUB_TOKEN}"        >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Add label on PR (create if missing)
+        id: label
+        run: |
+          set -euo pipefail
+          API="https://api.github.com"
+          TOKEN="${{ steps.auth.outputs.token }}"
+
+          # 1) Ensure label exists (422 means it exists → OK)
+          code=$(curl -sS -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -X POST "$API/repos/$REPO/labels" \
+            -d "{\"name\":\"$LABEL\",\"color\":\"D4C5F9\"}")
+          case "$code" in
+            201) echo "Created label '$LABEL'." ;;
+            200|409|422) echo "Label '$LABEL' already exists." ;;
+            403) echo "::error::403 creating label — token cannot write. Provide LABEL_BOT_TOKEN or enable 'Read and write' workflow perms."; exit 1 ;;
+            *)   echo "::warning::Unexpected status creating label: $code (continuing)";;
+          esac
+
+          # 2) Add it to this PR (Issues API handles PR labels)
+          code=$(curl -sS -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -X POST "$API/repos/$REPO/issues/$PR/labels" \
+            -d "{\"labels\":[\"$LABEL\"]}")
+          case "$code" in
+            200|201) echo "Added '$LABEL' to PR #$PR." ;;
+            403) echo "::error::403 adding label — token cannot write. Provide LABEL_BOT_TOKEN or enable 'Read and write' workflow perms."; exit 1 ;;
+            *)   echo "::error::Unexpected status adding label: $code"; exit 1 ;;
+          esac
+
+      - name: Wait up to 6h for label removal
+        id: wait
+        run: |
+          set -euo pipefail
+          API="https://api.github.com"
+          TOKEN="${{ steps.auth.outputs.token }}"
+          for i in $(seq 1 1080); do  # ~6h @ 20s
+            # stop if PR closes
+            state=$(curl -fsS -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" \
+                            "$API/repos/$REPO/pulls/$PR" | jq -r '.state')
+            if [ "$state" != "open" ]; then
+              echo "PR is $state; stop waiting."
+              echo "timed_out=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            # check label presence
+            has_label=$(curl -fsS -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" \
+                              "$API/repos/$REPO/issues/$PR/labels" \
+                        | jq -r --arg L "$LABEL" 'map(.name) | index($L) // empty')
+            if [ -z "$has_label" ]; then
+              echo "Label '$LABEL' was removed within window."
+              echo "timed_out=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            echo "Still labeled; sleeping 20s… ($i/1080)"
+            sleep 20
+          done
+          echo "timed_out=true" >> "$GITHUB_OUTPUT"
+
+      - name: Remove label if still present after 6h
+        if: ${{ steps.wait.outputs.timed_out == 'true' }}
+        run: |
+          set -euo pipefail
+          API="https://api.github.com"
+          TOKEN="${{ steps.auth.outputs.token }}"
+          enc=$(python3 - <<'PY'
+import os, urllib.parse
+print(urllib.parse.quote(os.environ['LABEL'], safe=''))
+PY
+)
+          code=$(curl -sS -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -X DELETE "$API/repos/$REPO/issues/$PR/labels/$enc")
+          case "$code" in
+            200) echo "Removed '$LABEL' after timeout." ;;
+            404) echo "Label '$LABEL' already gone." ;;
+            403) echo "::error::403 removing label — token cannot write. Provide LABEL_BOT_TOKEN or enable 'Read and write' workflow perms."; exit 1 ;;
+            *)   echo "::warning::Unexpected status removing label: $code" ;;
+          esac
