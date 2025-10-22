@@ -1,0 +1,57 @@
+# .github/workflows/informative-ci-status.yml
+name: Informative CI status
+
+on:
+  pull_request_target:
+    types: [opened, ready_for_review, reopened]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  add-label:
+    # Skip trusted authors (OWNER/MEMBER/COLLABORATOR) and Dependabot
+    if: ${{ !contains(fromJson('["MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
+           && github.actor != 'dependabot[bot]' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const info = {
+              number: pr.number,
+              title: pr.title,
+              author: pr.user.login,
+              author_association: pr.author_association,
+              base_repo: pr.base.repo.full_name,
+              head_repo: pr.head.repo.full_name,
+              is_fork: !!pr.head.repo.fork,
+            };
+            core.info('PR author info:\n' + JSON.stringify(info, null, 2));
+
+            const label = 'needs-ci-approval';
+            try {
+              // Ensure the label exists (422 = already exists)
+              try {
+                await github.request('POST /repos/{owner}/{repo}/labels', {
+                  ...context.repo,
+                  name: label,
+                  color: 'E3650b',
+                });
+              } catch (e) {
+                if (e.status !== 422) throw e;
+              }
+
+              // Add the label to the PR (PRs use the Issues API)
+              await github.rest.issues.addLabels({
+                ...context.repo,
+                issue_number: context.issue.number,
+                labels: [label],
+              });
+              core.info(`Added '${label}' to PR #${context.issue.number}`);
+            } catch (e) {
+              core.setFailed(`Failed to label PR: ${e.status || ''} ${e.message}`);
+            }
