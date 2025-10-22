@@ -25,7 +25,7 @@
 #include "buzzer/buzzer.h"
 
 int count = 0;
-
+//TEST
 int
 mynewt_main(int argc, char **argv)
 {
